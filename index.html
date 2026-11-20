@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>트리 영상 스튜디오</title>
+<script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.3/build/mp4-muxer.min.js"></script>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0c0f0e;color:#dfe6e1;font:14px "Malgun Gothic",system-ui,sans-serif}
+.wrap{display:flex;gap:20px;padding:16px;align-items:flex-start;flex-wrap:wrap}
+.stage{flex:0 0 auto}
+canvas{height:calc(100vh - 32px);max-height:1000px;min-height:480px;aspect-ratio:9/16;display:block;background:#000;border:1px solid #2a332e}
+.panel{flex:1 1 360px;max-width:520px;display:flex;flex-direction:column;gap:14px}
+fieldset{border:1px solid #2c3832;border-radius:8px;padding:12px;margin:0;display:flex;flex-direction:column;gap:8px}
+legend{padding:0 6px;color:#9fd0ad;font-weight:bold}
+label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:#a9b6ae}
+input,textarea,button{background:#151b18;color:#e8ede8;border:1px solid #3a4840;border-radius:6px;padding:8px;font:inherit}
+textarea{min-height:90px;resize:vertical;font-family:Consolas,monospace;font-size:12px}
+.row{display:flex;gap:8px}.row>*{flex:1}
+button{cursor:pointer}button.main{background:#1f5a36;border-color:#3f8a5c;font-weight:bold;padding:12px}
+button:disabled{opacity:.5;cursor:wait}
+#status{min-height:20px;color:#ffd98a;font-size:13px;white-space:pre-line}
+small{color:#7d8a82}
+</style>
+
+<div class="wrap">
+  <div class="stage"><canvas id="cv" width="1080" height="1920"></canvas></div>
+  <div class="panel">
+    <fieldset>
+      <legend>1. 인스타그램에서 불러오기 (선택)</legend>
+      <label>미디어 ID (게시물 여러 개면 쉼표로 구분)<input id="mediaId" placeholder="17900000000000000"></label>
+      <label>액세스 토큰<input id="token" type="password" placeholder="EAAG... 또는 IGQ..."></label>
+      <label>API 주소<input id="apiBase" value="https://graph.facebook.com/v21.0"></label>
+      <label>제외할 계정 (우리 계정 등, 줄바꿈 구분)<textarea id="exclude" style="min-height:50px"></textarea></label>
+      <button id="fetchBtn">인스타 데이터 불러오기</button>
+      <small>API를 안 쓰면 이 칸은 비워 두고 2번에 직접 입력하세요. 토큰은 이 PC 브라우저에만 저장됩니다.</small>
+    </fieldset>
+    <fieldset>
+      <legend>2. 데이터 (직접 입력·수정)</legend>
+      <div class="row">
+        <label>좋아요 수<input id="likes" type="number" min="0" value="0"></label>
+        <label>목표 좋아요 (별 점등)<input id="goal" type="number" min="1" value="1000"></label>
+      </div>
+      <label>트리에 걸 계정명 (한 줄에 하나 · 새 이름은 맨 아래에 추가)<textarea id="names"></textarea></label>
+    </fieldset>
+    <fieldset>
+      <legend>3. 화면 문구</legend>
+      <label>제목<input id="title" value="MERRY CHRISTMAS"></label>
+      <label>하단 안내 (줄바꿈 가능)<textarea id="caption" style="min-height:50px">홍보 영상에 댓글을 남기면
+트리에 이름이 걸려요</textarea></label>
+      <label>계정 표시<input id="account" value="@our.brand"></label>
+      <div class="row">
+        <label>한 바퀴 = 영상 길이(초)<input id="dur" type="number" min="10" max="90" value="30"></label>
+        <label>기준일 표시<input id="dateLabel"></label>
+      </div>
+    </fieldset>
+    <button id="applyBtn">미리보기에 적용</button>
+    <button id="recBtn" class="main">영상 만들기 (MP4 다운로드)</button>
+    <div id="status"></div>
+  </div>
+</div>
+
+<script>
+'use strict';
+const W=1080,H=1920,CX=540,TAU=Math.PI*2;
+const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
+const $=id=>document.getElementById(id);
+const FIELDS=['mediaId','token','apiBase','exclude','likes','goal','names','title','caption','account','dur','dateLabel'];
+const status=msg=>{$('status').textContent=msg};
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+/* ---------- 설정 저장/복원 (이 브라우저에만) ---------- */
+function loadSaved(){try{const s=JSON.parse(localStorage.getItem('treeStudio')||'{}');FIELDS.forEach(k=>{if(s[k]!=null)$(k).value=s[k]})}catch(e){}}
+function save(){try{const s={};FIELDS.forEach(k=>s[k]=$(k).value);localStorage.setItem('treeStudio',JSON.stringify(s))}catch(e){}}
+
+/* ---------- 데이터 정리 ---------- */
+function parseList(text){
+  return String(text||'').split(/[\n,]+/).map(s=>s.trim().replace(/^@/,'').toLowerCase()).filter(s=>/^[a-z0-9._]{1,30}$/.test(s)).map(s=>'@'+s);
+}
+function cleanNames(text,excludeText){
+  const ex=new Set(parseList(excludeText)),seen=new Set(),out=[];
+  for(const n of parseList(text)){if(!ex.has(n)&&!seen.has(n)){seen.add(n);out.push(n)}}
+  return out;
+}
+function rng(seed){return()=>{seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed/4294967296}}
+
+/* ---------- 3D 트리 구조 ----------
+   트리 = 세로축을 중심으로 한 5단 원뿔. 가지(이름 1개)는 줄기에서 바깥으로 뻗고 끝이 처짐.
+   좌표: r = 줄기로부터 거리, th = 둘레 각도, tg = 가지 옆 방향 흔들림, y = 화면 높이 */
+const SX=2.1,SY=2.55,OY=230,FS=2.2;
+const mapY=y=>OY+y*SY;
+const PALETTE=['#305b3f','#48825b','#68a379','#87bb88','#4a805d','#bad3ac','#e08f83','#f2dcae'];
+const UNLIT='#2a4a36',WARM='#fff0c8';
+const CAM=3000,Y0=900,TILT=.11,RMAX=470;
+
+function buildLayout(n){
+  const N=Math.max(240,n),random=rng(1807);
+  const weights=[20,32,44,56,68];
+  const counts=weights.map(w=>Math.round(N*w/220));counts[4]+=N-counts.reduce((a,b)=>a+b,0);
+  const per=Math.max(8,Math.min(30,Math.round(30*240/N)));
+  const slots=[],glyphs=[];let g=0;
+  for(let tier=0;tier<5;tier++){
+    const top=[55,107,173,241,316][tier],depth=[114,126,128,140,163][tier],reach=[55,93,136,179,220][tier];
+    for(let i=0;i<counts[tier];i++,g++){
+      const f=random(),z=random(),len=reach*(0.24+0.76*f)*SX;
+      const th=(g*2.39996+tier*.7)%TAU; // 황금각으로 둘레에 고르게 분산
+      const baseY=mapY(top+depth*(0.05+0.43*f)+z*13),tipY=mapY(top+depth*(0.43+0.54*f)+z*17);
+      const slot={th,r:len*.64,y:baseY+(tipY-baseY)*Math.pow(.64,.78),name:null};
+      for(let j=0;j<per;j++){
+        const u=random(),spread=(Math.sin(Math.PI*u)*12+2)*SX;
+        const tint=random(),color=tint>.985?PALETTE[6]:tint>.965?PALETTE[7]:PALETTE[Math.min(5,Math.floor(random()*3+u*2+z))];
+        glyphs.push({slot,j,th,
+          r:len*u+(random()-.5)*spread*.5,
+          tg:(random()-.5)*spread,
+          y:baseY+(tipY-baseY)*Math.pow(u,.78)+(random()-.45)*spread*.8+Math.sin(u*7+i)*3*SY,
+          color,size:(5+4*u+random()*3)*FS*(per<30?1.1:1),alpha:.4+random()*.5});
+      }
+      slots.push(slot);
+    }
+  }
+  slots.sort((a,b)=>b.y-a.y); // 아래 가지부터 채움
+  const r2=rng(2412),ornaments=[];
+  for(let k=0;k<80;k++){const p=glyphs[Math.floor(r2()*glyphs.length)];
+    ornaments.push({th:p.th,r:p.r+8,tg:p.tg,y:p.y,size:.7+r2()*.6,color:k%5,m:1+Math.floor(r2()*4),ph:r2()*TAU,order:r2()})}
+  ornaments.sort((a,b)=>a.order-b.order);ornaments.forEach((o,i)=>o.idx=i); // 좋아요가 늘면 idx 순서대로 켜짐
+  return {slots,glyphs,ornaments};
+}
+
+/* 3D → 화면 투영. phi = 회전 각도 */
+function project(p,phi,out){
+  const a=p.th+phi,c=Math.cos(a),s=Math.sin(a);
+  const X=p.r*c-p.tg*s,Z=p.r*s+p.tg*c,sc=CAM/(CAM-Z);
+  out.x=CX+X*sc;out.y=Y0+(p.y-Y0)*sc+Z*TILT;out.z=Z;out.sc=sc;return out;
+}
+
+/* ---------- 글자·전구 스프라이트 캐시 (매 프레임 수천 개를 빠르게 그리기 위해) ---------- */
+const sprites=new Map();
+function sprite(ch,color){
+  const key=ch+color;let c=sprites.get(key);if(c)return c;
+  c=document.createElement('canvas');const g=c.getContext('2d');g.font='48px Georgia';
+  c.width=Math.ceil(g.measureText(ch).width)+6;c.height=62;
+  g.font='48px Georgia';g.fillStyle=color;g.fillText(ch,3,47);sprites.set(key,c);return c;
+}
+const ORN_COLORS=['#ff5a4f','#ffcf5a','#fff4dc','#ff8fb0','#7fd4ff'];
+const bulbs=ORN_COLORS.map(col=>{const c=document.createElement('canvas');c.width=c.height=64;const g=c.getContext('2d');
+  const gr=g.createRadialGradient(32,32,0,32,32,32);gr.addColorStop(0,'#ffffff');gr.addColorStop(.18,col);gr.addColorStop(.45,col+'66');gr.addColorStop(1,col+'00');
+  g.fillStyle=gr;g.fillRect(0,0,64,64);return c});
+
+/* ---------- 배경 (한 번만 그림) ---------- */
+const bgC=document.createElement('canvas');bgC.width=W;bgC.height=H;
+let snow=[];
+function paintBackground(){
+  const g=bgC.getContext('2d'),gr=g.createLinearGradient(0,0,0,H);
+  gr.addColorStop(0,'#03050b');gr.addColorStop(.6,'#07101a');gr.addColorStop(1,'#0c1620');
+  g.fillStyle=gr;g.fillRect(0,0,W,H);
+  const r=rng(77);for(let i=0;i<220;i++){g.globalAlpha=.15+r()*.4;g.fillStyle='#dfe8f0';const s=r()*2+.6;g.fillRect(r()*W,r()*H*.8,s,s)}
+  g.globalAlpha=1;
+  // 바닥 빛과 트리 그림자
+  const fl=g.createRadialGradient(CX,1640,10,CX,1640,560);fl.addColorStop(0,'rgba(200,220,235,.16)');fl.addColorStop(1,'rgba(200,220,235,0)');
+  g.fillStyle=fl;g.fillRect(0,0,W,H);
+  g.save();g.translate(CX,1600);g.scale(1,.16);const sh=g.createRadialGradient(0,0,0,0,0,460);
+  sh.addColorStop(0,'rgba(0,0,0,.55)');sh.addColorStop(1,'rgba(0,0,0,0)');g.fillStyle=sh;g.beginPath();g.arc(0,0,460,0,TAU);g.fill();g.restore();
+  // 원뿔 속을 어둡게 채워 입체감
+  const core=g.createLinearGradient(0,380,0,1500);core.addColorStop(0,'rgba(8,24,15,.0)');core.addColorStop(1,'rgba(8,24,15,.55)');
+  g.fillStyle=core;g.beginPath();g.moveTo(CX,380);g.lineTo(CX+330,1450);g.quadraticCurveTo(CX,1530,CX-330,1450);g.closePath();g.fill();
+  // 줄기
+  g.font='22px Georgia';const t=rng(5);
+  for(let k=0;k<170;k++){g.fillStyle=k%3?'#3a3027':'#634b39';g.fillText('iyl'[k%3],510+t()*58,1475+t()*150)}
+  const sr=rng(99);snow=[];for(let i=0;i<150;i++)snow.push({x:sr()*W,y:sr()*H,s:1+sr()*3.5,k:sr()<.3?2:1,sw:10+sr()*25,m:1+Math.floor(sr()*3),ph:sr()*TAU});
+}
+
+/* ---------- 상태 ---------- */
+let state={names:[],likes:0,goal:1000,layout:null,spotlight:[]};
+let items=[]; // 매 프레임 깊이 정렬용
+
+function apply(){
+  const names=cleanNames($('names').value,$('exclude').value);
+  state.names=names;state.likes=Math.max(0,+$('likes').value||0);state.goal=Math.max(1,+$('goal').value||1);
+  state.layout=buildLayout(names.length);
+  state.layout.slots.forEach((s,i)=>s.name=names[i]||null);
+  const {glyphs,ornaments}=state.layout;
+  items=glyphs.map(p=>({kind:0,p,x:0,y:0,z:0,sc:1})).concat(ornaments.map(p=>({kind:1,p,x:0,y:0,z:0,sc:1})));
+  state.spotlight=state.layout.slots.filter(s=>s.name).slice(-5);
+  save();
+  status('적용됨 · 이름 '+names.length+'개 / 가지 '+state.layout.slots.length+'개 · 좋아요 '+state.likes);
+}
+
+/* ---------- 프레임: t = 0~1 (한 바퀴). 모든 움직임이 주기 함수라 끝과 시작이 이어짐 ---------- */
+function frame(t){
+  const {likes,goal,layout}=state,ratio=Math.min(1,likes/goal),done=likes>=goal;
+  const phi=TAU*t,showLabels=layout.slots.length<=400;
+  ctx.globalCompositeOperation='source-over';ctx.globalAlpha=1;ctx.shadowBlur=0;
+  ctx.drawImage(bgC,0,0);
+
+  // 투영 후 뒤쪽부터 그리기
+  for(const it of items)project(it.p,phi,it);
+  items.sort((a,b)=>a.z-b.z);
+  const lit=Math.round(layout.ornaments.length*ratio);
+  const band=1560-1300*((t*2)%1); // 빛 띠가 한 바퀴에 두 번 아래→위로 훑음
+  for(const it of items){
+    const depth=Math.max(0,Math.min(1,(it.z/RMAX+1)/2)),fog=.25+.75*depth;
+    if(it.kind===0){
+      const p=it.p,name=p.slot.name,ch=name?name[p.j%name.length]:'*';
+      const img=sprite(ch,name?p.color:UNLIT),k=p.size*it.sc/48;
+      ctx.globalAlpha=p.alpha*fog*(name?1:.45);
+      ctx.drawImage(img,it.x,it.y-47*k,img.width*k,img.height*k);
+      if(name){const b=1-Math.abs(it.y-band)/170;if(b>0){ctx.globalCompositeOperation='lighter';ctx.globalAlpha=b*.55*fog;
+        ctx.drawImage(sprite(ch,WARM),it.x,it.y-47*k,img.width*k,img.height*k);ctx.globalCompositeOperation='source-over'}}
+    }else{
+      const o=it.p;if(o.idx>=lit)continue;
+      const a=(.55+.45*Math.sin(TAU*t*o.m*3+o.ph))*fog,s=44*o.size*it.sc;
+      ctx.globalAlpha=a;ctx.globalCompositeOperation='lighter';ctx.drawImage(bulbs[o.color],it.x-s/2,it.y-s/2,s,s);ctx.globalCompositeOperation='source-over';
+    }
+  }
+  ctx.globalAlpha=1;
+
+  // 앞쪽을 향한 가지에만 계정명 라벨
+  if(showLabels){const q={};ctx.fillStyle='#c4e0c9';
+    for(const s of layout.slots){if(!s.name)continue;project({th:s.th,r:s.r+20,tg:0,y:s.y},phi,q);
+      const face=Math.sin(s.th+phi);if(face<.55)continue;
+      ctx.globalAlpha=.9*(face-.55)/.45;ctx.font=(18*q.sc).toFixed(1)+'px Georgia';ctx.fillText(s.name,q.x-40*q.sc,q.y,95*q.sc)}
+    ctx.globalAlpha=1}
+
+  // 최근 참여자 5명: 각자 가지가 정면에 올 때 크게 떠오름
+  const q={};
+  for(const s of state.spotlight){
+    const tf=(((Math.PI/2-s.th)/TAU)%1+1)%1;let d=Math.abs(t-tf);d=Math.min(d,1-d);if(d>.045)continue;
+    const a=1-d/.045;project({th:s.th,r:s.r,tg:0,y:s.y},phi,q);
+    ctx.globalAlpha=a*.5;ctx.strokeStyle='#ffe6a8';ctx.lineWidth=3;ctx.beginPath();ctx.arc(q.x,q.y-8,44+16*(1-a),0,TAU);ctx.stroke();
+    ctx.globalAlpha=a;ctx.font='bold 40px Georgia';ctx.textAlign='center';ctx.shadowColor='#000';ctx.shadowBlur=14;ctx.fillStyle='#fff1cf';
+    ctx.fillText(s.name,Math.max(200,Math.min(W-200,q.x)),q.y-62-12*a);ctx.textAlign='left';ctx.shadowBlur=0;ctx.globalAlpha=1;
+  }
+
+  // 꼭대기 별: 세로축으로 같이 돌며, 좋아요 비율에 따라 밝아짐
+  ctx.save();ctx.translate(CX,330);
+  const pulse=.5+.5*Math.sin(TAU*t*4);
+  if(done){ctx.globalAlpha=.25+.2*pulse;ctx.strokeStyle='#ffe29a';ctx.lineWidth=3;
+    for(let i=0;i<12;i++){const a=i*TAU/12+phi;ctx.beginPath();ctx.moveTo(Math.cos(a)*60,Math.sin(a)*60);ctx.lineTo(Math.cos(a)*(110+20*pulse),Math.sin(a)*(110+20*pulse));ctx.stroke()}}
+  ctx.globalAlpha=1;ctx.shadowColor='#ffd26e';ctx.shadowBlur=done?50+20*pulse:8+30*ratio;
+  const turn=Math.cos(phi*2);ctx.scale(Math.max(.25,Math.abs(turn)),1);
+  ctx.fillStyle=done?'#ffe08a':mix('#4a4232','#d8b260',ratio);
+  ctx.beginPath();for(let i=0;i<10;i++){const a=i*Math.PI/5-Math.PI/2,r=i%2?20:48;ctx.lineTo(Math.cos(a)*r,Math.sin(a)*r)}ctx.closePath();ctx.fill();
+  ctx.restore();ctx.shadowBlur=0;
+
+  // 눈
+  ctx.fillStyle='#eef4f8';
+  for(const p of snow){const y=(p.y+H*p.k*t)%H,x=p.x+Math.sin(TAU*t*p.m+p.ph)*p.sw;ctx.globalAlpha=.35+.12*p.s;ctx.beginPath();ctx.arc(x,y,p.s,0,TAU);ctx.fill()}
+  ctx.globalAlpha=1;
+  drawText(ratio,done);
+}
+
+function drawText(ratio,done){
+  const {likes,goal,names}=state;ctx.textAlign='center';
+  ctx.font='italic 64px Georgia';ctx.fillStyle='#f3dfa8';ctx.shadowColor='rgba(255,210,120,.5)';ctx.shadowBlur=18;
+  ctx.fillText($('title').value,CX,130);ctx.shadowBlur=0;
+  ctx.font='bold 38px "Malgun Gothic",sans-serif';ctx.fillStyle='#ffffff';
+  ctx.fillText('♥ '+likes.toLocaleString('ko-KR')+'   ·   참여 '+names.length.toLocaleString('ko-KR')+'명',CX,200);
+  const bw=640,bx=CX-bw/2,by=228;ctx.fillStyle='#1b2622';roundRect(bx,by,bw,14,7);ctx.fill();
+  const pg=ctx.createLinearGradient(bx,0,bx+bw,0);pg.addColorStop(0,'#c9504a');pg.addColorStop(1,'#ffd36e');
+  ctx.fillStyle=pg;roundRect(bx,by,Math.max(14,bw*ratio),14,7);ctx.fill();
+  ctx.font='24px "Malgun Gothic",sans-serif';ctx.fillStyle=done?'#ffe08a':'#9fb2a8';
+  ctx.fillText(done?'목표 달성! 별이 켜졌어요 ★':'좋아요 '+goal.toLocaleString('ko-KR')+'개가 되면 별이 켜져요',CX,272);
+  const lines=$('caption').value.split('\n').filter(Boolean);
+  ctx.font='bold 42px "Malgun Gothic",sans-serif';ctx.fillStyle='#ffffff';
+  lines.forEach((l,i)=>ctx.fillText(l,CX,1720+i*58));
+  ctx.font='30px Georgia';ctx.fillStyle='#b8d6bf';ctx.fillText($('account').value,CX,1720+lines.length*58+20);
+  if($('dateLabel').value){ctx.font='22px "Malgun Gothic",sans-serif';ctx.fillStyle='#6f7d75';ctx.fillText($('dateLabel').value,CX,1885)}
+  ctx.textAlign='left';
+}
+function roundRect(x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath()}
+function mix(a,b,k){const p=s=>[1,3,5].map(i=>parseInt(s.substr(i,2),16)),A=p(a),B=p(b);return'rgb('+A.map((v,i)=>Math.round(v+(B[i]-v)*k)).join(',')+')'}
+
+/* ---------- 인스타그램 Graph API (무료, 선택 사항) ---------- */
+async function fetchInsta(){
+  const base=$('apiBase').value.trim().replace(/\/$/,''),tok=$('token').value.trim();
+  const ids=$('mediaId').value.split(',').map(s=>s.trim()).filter(Boolean);
+  if(!ids.length||!tok){status('미디어 ID와 토큰을 입력해 주세요. (API 없이 쓰려면 2번 칸에 직접 입력)');return}
+  const get=async url=>{const r=await fetch(url),j=await r.json();if(!r.ok||j.error)throw new Error((j.error&&j.error.message)||('HTTP '+r.status));return j};
+  const enc=encodeURIComponent(tok);let likes=0;const comments=[];
+  $('fetchBtn').disabled=true;
+  try{
+    for(const id of ids){
+      status('불러오는 중… '+id);
+      const m=await get(base+'/'+id+'?fields=like_count,comments_count&access_token='+enc);
+      likes+=m.like_count||0;
+      let url=base+'/'+id+'/comments?fields=username,timestamp&limit=50&access_token='+enc;
+      while(url){const j=await get(url);comments.push(...(j.data||[]));url=j.paging&&j.paging.next;status('댓글 '+comments.length+'개 불러옴…')}
+    }
+    comments.sort((a,b)=>String(a.timestamp).localeCompare(String(b.timestamp)));
+    const old=parseList($('names').value),fetched=comments.map(c=>c.username).filter(Boolean).map(n=>'@'+n);
+    $('names').value=cleanNames(old.concat(fetched).join('\n'),'').join('\n'); // 기존 순서 유지 + 새 이름 뒤에
+    $('likes').value=likes;
+    const d=new Date();$('dateLabel').value=(d.getMonth()+1)+'월 '+d.getDate()+'일 기준';
+    apply();status('불러오기 완료 · 좋아요 '+likes+' · 댓글 '+comments.length+'개 → 이름 '+state.names.length+'개');
+  }catch(e){status('불러오기 실패: '+e.message+'\n(토큰 만료·권한·미디어 ID를 확인해 주세요. 2번 칸을 직접 고쳐도 됩니다.)')}
+  finally{$('fetchBtn').disabled=false}
+}
+
+/* ---------- 미리보기 재생 ---------- */
+let origin=performance.now(),recording=false;
+const dur=()=>Math.max(10,Math.min(90,+$('dur').value||30))*1000;
+function loop(now){if(!recording)frame(((now-origin)%dur())/dur());requestAnimationFrame(loop)}
+
+/* ---------- 영상 만들기: 한 프레임씩 정확히 인코딩 (PC 속도와 무관하게 매끄러움) ---------- */
+async function encodeFrames(D){
+  const fps=30,total=Math.round(D/1000*fps);let cfg=null;
+  for(const codec of ['avc1.640028','avc1.4d0028','avc1.42002a']){
+    const c={codec,width:W,height:H,bitrate:8e6,framerate:fps};
+    try{if((await VideoEncoder.isConfigSupported(c)).supported){cfg=c;break}}catch(e){}
+  }
+  if(!cfg)return null;
+  const muxer=new Mp4Muxer.Muxer({target:new Mp4Muxer.ArrayBufferTarget(),video:{codec:'avc',width:W,height:H,frameRate:fps},fastStart:'in-memory'});
+  let err=null;const enc=new VideoEncoder({output:(c,m)=>muxer.addVideoChunk(c,m),error:e=>{err=e}});
+  enc.configure(cfg);
+  for(let i=0;i<total;i++){
+    if(err)throw err;
+    frame(i/total);
+    const vf=new VideoFrame(cv,{timestamp:Math.round(i*1e6/fps),duration:Math.round(1e6/fps)});
+    enc.encode(vf,{keyFrame:i%(fps*2)===0});vf.close();
+    while(enc.encodeQueueSize>6)await sleep(2);
+    if(i%5===0){status('영상 만드는 중… '+Math.round(i/total*100)+'%');await sleep(0)}
+  }
+  await enc.flush();if(err)throw err;muxer.finalize();
+  return {blob:new Blob([muxer.target.buffer],{type:'video/mp4'}),ext:'mp4'};
+}
+// 예비: 인터넷이 없어 인코더 라이브러리를 못 불러온 경우 실시간 녹화
+async function recordRealtime(D){
+  const types=['video/mp4;codecs=avc1.640028','video/mp4;codecs=avc1','video/mp4','video/webm;codecs=vp9','video/webm'];
+  const type=types.find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t));if(!type)return null;
+  const stream=cv.captureStream(30),rec=new MediaRecorder(stream,{mimeType:type,videoBitsPerSecond:16e6}),chunks=[];
+  rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};const done=new Promise(r=>rec.onstop=r);
+  frame(0);rec.start(250);const start=performance.now();
+  (function tick(now){const el=now-start;if(el>=D){rec.stop();return}frame(el/D);status('실시간 녹화 중… '+Math.ceil((D-el)/1000)+'초 남음\n이 탭을 화면에 띄워 두세요.');requestAnimationFrame(tick)})(start);
+  await done;stream.getTracks().forEach(t=>t.stop());
+  return {blob:new Blob(chunks,{type:type.split(';')[0]}),ext:type.startsWith('video/mp4')?'mp4':'webm'};
+}
+async function record(){
+  apply();$('recBtn').disabled=true;recording=true;
+  try{
+    const D=dur();let out=null;
+    if(window.VideoEncoder&&window.Mp4Muxer)out=await encodeFrames(D);
+    if(!out)out=await recordRealtime(D);
+    if(!out){status('이 브라우저는 영상 만들기를 지원하지 않아요. 최신 Chrome에서 열어 주세요.');return}
+    const d=new Date(),stamp=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+    const a=document.createElement('a');a.href=URL.createObjectURL(out.blob);a.download='tree-'+stamp+'.'+out.ext;document.body.appendChild(a);a.click();a.remove();
+    status('완료: '+a.download+' ('+(out.blob.size/1048576).toFixed(1)+'MB)'+(out.ext==='webm'?'\n※ WebM으로 저장됐어요. 최신 Chrome을 써 주세요.':''));
+  }catch(e){status('영상 만들기 실패: '+e.message)}
+  finally{recording=false;$('recBtn').disabled=false;origin=performance.now()}
+}
+
+$('applyBtn').onclick=apply;$('fetchBtn').onclick=fetchInsta;$('recBtn').onclick=record;
+['title','caption','account','dateLabel'].forEach(k=>$(k).addEventListener('input',save));
+
+/* ---------- 시작 ---------- */
+loadSaved();
+if(!$('names').value.trim()){ // 처음 열었을 때 보여줄 예시 데이터
+  const w='holly pine snow cocoa berry moon ivy merry star plum'.split(' ');
+  $('names').value=Array.from({length:150},(_,i)=>'@'+w[i%10]+'.'+w[Math.floor(i/10)%10]+(i+1)).join('\n');$('likes').value=640;
+}
+paintBackground();apply();requestAnimationFrame(loop);
+</script>
+</html>
